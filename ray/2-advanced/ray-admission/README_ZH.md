@@ -1,6 +1,10 @@
 # Ray Admission 使用说明
 
-许可状态、故障处理及存储优化方案见 [控制器设计](DESIGN.md)。
+许可状态、故障处理及存储优化方案见 [中文设计文档](DESIGN_ZH.md)
+和 [English design](DESIGN.md)。
+评审后的协议和当前实现边界见 [可靠性改进设计](RELIABILITY_PLAN_ZH.md)。核心修复
+已经实现，仍需通过完整验收矩阵后才能按“故障后可自动恢复的配额服务”验收。
+真实 CLI、quota、remote 和故障恢复验收见 [端到端测试](tests/e2e/README.md)。
 
 本目录是独立的 `ray-admission` Python 安装包，提供 `ray-admission` CLI 和
 `ray_admission.queue` 模块。当前 `ray-admission list` 只有 `queue` 实现：

@@ -166,3 +166,10 @@ class BoundedWriter:
                     future.set_result(None)
             finally:
                 self.requests.task_done()
+
+    async def quiesce(self):
+        """Wait until the blocking call has returned, then stop this writer."""
+        await self.requests.join()
+        if self.task is not None:
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)

@@ -1,17 +1,27 @@
-"""Single-writer admission state machine backed by recoverable GCS KV records."""
+"""Single-writer queue state machine with short admission RPCs and GCS recovery."""
 
 import asyncio
 import base64
 import hashlib
 import hmac
 import json
-from collections import Counter, deque
+import random
+import time
+import uuid
+from collections import Counter, defaultdict, deque
 
 import ray
 
 from ray_admission._storage import BoundedWriter, GcsStore
 
 NAMESPACE = "ray-submission-queue"
+PROTOCOL_VERSION = 3
+MAX_WAITING = 100_000
+MAX_WAITING_PER_KEY = 10_000
+
+
+class ServiceRecovering(RuntimeError):
+    """A transient recovery state; retry the same operation identity."""
 
 
 def quota_key(key):
@@ -32,52 +42,91 @@ class QueueController:
         from ray_admission.queue import _validate_resources
 
         self._validate = _validate_resources
-        self._store = GcsStore(admin_token_digest)
-        self._writer = BoundedWriter(self._store)
         self._admin_token_digest = admin_token_digest
         self._lock = asyncio.Lock()
-        self._records = self._store.load()
+        self._store = GcsStore(admin_token_digest)
+        self._writer = BoundedWriter(self._store)
+        self._records = {}
         self._quotas = {}
         self._sessions = {}
         self._counts = Counter()
+        self._rpc_counts = Counter()
         self._usage = {}
         self._permits = {}
         self._tracked = {}
         self._actors = {}
         self._released = set()
+        self._released_by_session = defaultdict(set)
         self._waiting = {}
-        self._pending = {}
-        self._requests = {}
-        self._storage_error = None
-        self._monitor_error = None
+        self._waiting_tickets = {}
         self._monitor = None
         self._drainer = None
-        for name, record in self._records.items():
+        self._recovery = None
+        self._recovery_state = "READY"
+        self._storage_error = None
+        self._monitor_error = None
+        self._recovery_attempts = 0
+        self._recovery_started = None
+        self._last_recovery_seconds = None
+        self._last_successful_commit = None
+        self._last_actor_poll = 0.0
+        self._actor_states = {}
+        self._actor_poll_cursor = 0
+        self._incarnation = uuid.uuid4().hex
+        self._generation = 0
+        self._load_records(self._store.load())
+        self._start_monitor()
+
+    def _load_records(self, records):
+        self._records = records
+        self._quotas.clear()
+        self._sessions.clear()
+        self._usage.clear()
+        self._permits.clear()
+        self._tracked.clear()
+        self._actors.clear()
+        self._released.clear()
+        self._released_by_session.clear()
+        for name, record in records.items():
             if name.startswith("quota/"):
                 self._validate(record["resources"])
                 self._quotas[tuple(record["key"])] = record["resources"]
             elif name.startswith("session/"):
                 self._sessions[name[8:]] = record["watermark"]
             elif name.startswith("permit/"):
-                self._apply_permit(name[7:], record)
+                ticket = name[7:]
+                # v2 RESERVED may have crossed the old submit boundary. Never
+                # make it safely cancellable under the v3 protocol.
+                if record["state"] == "RESERVED" and record.get("protocol", 2) < 3:
+                    record = {**record, "state": "SUBMITTING", "protocol": 3}
+                    self._records[name] = record
+                self._apply_permit(ticket, record)
             else:
                 raise RuntimeError("Unknown storage record: " + name)
-        self._start_monitor()
 
     def _apply_permit(self, ticket, record):
         old = self._permits.pop(ticket, None)
         if old:
             key, resources = old
             self._usage[key].subtract(resources)
+            for resource in resources:
+                if abs(self._usage[key][resource]) <= 1e-9:
+                    self._usage[key][resource] = 0
         self._tracked.pop(ticket, None)
         self._actors.pop(ticket, None)
         self._released.discard(ticket)
+        parts = ticket_parts(ticket)
+        if parts:
+            self._released_by_session[parts[0]].discard(parts[1])
         if record is None:
             return
-        if record["state"] == "RELEASED":
+        state = record["state"]
+        if state == "RELEASED":
             self._released.add(ticket)
+            if parts:
+                self._released_by_session[parts[0]].add(parts[1])
             return
-        if record["state"] not in ("RESERVED", "TRACKED"):
+        if state not in ("RESERVED", "SUBMITTING", "TRACKED"):
             raise RuntimeError("Invalid permit state")
         key = tuple(record["key"])
         resources = self._validate(record["resources"])
@@ -91,13 +140,15 @@ class QueueController:
         if record.get("actor_id"):
             self._actors[ticket] = record["actor_id"]
 
-    def _ensure_writable(self):
-        if self._storage_error is not None:
-            raise RuntimeError("Queue storage unavailable; restart required")
+    def _ensure_ready(self):
+        if self._recovery_state in ("QUIESCING", "RECOVERING", "BACKOFF"):
+            raise ServiceRecovering(self._recovery_state)
+        if self._recovery_state != "READY":
+            raise RuntimeError(f"Queue service is {self._recovery_state}; retry later")
 
     async def _commit(self, changes):
-        """Called under the mutation lock; publish memory only after commit."""
-        self._ensure_writable()
+        self._ensure_ready()
+        generation = self._generation
         changes = [
             (
                 key,
@@ -113,14 +164,17 @@ class QueueController:
         try:
             await self._writer.commit(changes)
         except BaseException as error:
-            # Cancellation can race a committed write just like a lost reply.
             self._storage_error = str(error)
-            for future in self._pending.values():
-                if not future.done():
-                    future.set_exception(
-                        RuntimeError("Queue storage unavailable; restart required")
-                    )
-            raise RuntimeError("Queue storage unavailable; restart required") from error
+            self._begin_recovery()
+            raise ServiceRecovering(
+                "Queue storage unavailable; recovery started"
+            ) from error
+        if generation != self._generation:
+            raise ServiceRecovering("Commit completed during recovery; retry operation")
+        self._publish(changes)
+        self._last_successful_commit = time.time()
+
+    def _publish(self, changes):
         for key, record in changes:
             if record is None:
                 self._records.pop(key, None)
@@ -129,11 +183,70 @@ class QueueController:
             if key.startswith("permit/"):
                 self._apply_permit(key[7:], record)
 
+    def _begin_recovery(self):
+        if self._recovery is None or self._recovery.done():
+            self._generation += 1
+            self._recovery_state = "QUIESCING"
+            self._recovery_started = time.monotonic()
+            self._recovery = asyncio.create_task(self._recover())
+
+    async def _recover(self):
+        delay = 0.05
+        while True:
+            self._recovery_attempts += 1
+            try:
+                self._recovery_state = "QUIESCING"
+                await asyncio.wait_for(self._writer.quiesce(), timeout=30)
+                self._recovery_state = "RECOVERING"
+                store = await asyncio.to_thread(GcsStore, self._admin_token_digest)
+                records = await asyncio.to_thread(store.load)
+                async with self._lock:
+                    self._store = store
+                    self._writer = BoundedWriter(store)
+                    self._load_records(records)
+                    persisted_tickets = self._records_ticket_set()
+                    for key, waiting in list(self._waiting.items()):
+                        self._waiting[key] = deque(
+                            x for x in waiting if x[0] not in persisted_tickets
+                        )
+                        if not self._waiting[key]:
+                            del self._waiting[key]
+                    self._waiting_tickets = {
+                        t: v
+                        for t, v in self._waiting_tickets.items()
+                        if t not in persisted_tickets
+                    }
+                    self._storage_error = None
+                    self._recovery_state = "READY"
+                    self._last_recovery_seconds = (
+                        time.monotonic() - self._recovery_started
+                    )
+                self._start_monitor()
+                self._schedule_drain()
+                return
+            except asyncio.TimeoutError:
+                self._recovery_state = "RESTART_REQUIRED"
+                return
+            except Exception as error:
+                self._storage_error = str(error)
+                self._recovery_state = "BACKOFF"
+                await asyncio.sleep(delay + random.random() * delay)
+                delay = min(delay * 2, 5)
+
+    async def recover(self, *, admin_token=None):
+        self.check_admin(admin_token)
+        self._begin_recovery()
+        if self._recovery is not None:
+            await asyncio.shield(self._recovery)
+        return self._recovery_state
+
     def check_admin(self, token):
-        if not isinstance(token, str) or not token:
-            raise PermissionError("Queue administrator credentials required")
-        if not hmac.compare_digest(
-            hashlib.sha256(token.encode()).hexdigest(), self._admin_token_digest
+        if (
+            not isinstance(token, str)
+            or not token
+            or not hmac.compare_digest(
+                hashlib.sha256(token.encode()).hexdigest(), self._admin_token_digest
+            )
         ):
             raise PermissionError("Invalid queue administrator credentials")
 
@@ -141,7 +254,7 @@ class QueueController:
         if not session or any(c not in "0123456789abcdef" for c in session):
             raise ValueError("Invalid session ID")
         async with self._lock:
-            self._ensure_writable()
+            self._ensure_ready()
             if session not in self._sessions:
                 await self._commit([("session/" + session, {"watermark": 0})])
                 self._sessions[session] = 0
@@ -151,6 +264,7 @@ class QueueController:
         return parts is not None and parts[1] <= self._sessions.get(parts[0], 0)
 
     async def acknowledge(self, session, watermark):
+        self._rpc_counts["acknowledge"] += 1
         if (
             isinstance(watermark, bool)
             or not isinstance(watermark, int)
@@ -158,21 +272,24 @@ class QueueController:
         ):
             raise ValueError("Invalid acknowledgment watermark")
         async with self._lock:
-            self._ensure_writable()
+            self._ensure_ready()
             if session not in self._sessions:
                 raise ValueError("Unknown session")
             if watermark > self._sessions[session]:
                 await self._commit([("session/" + session, {"watermark": watermark})])
                 self._sessions[session] = watermark
-            await self._compact_locked()
+            await self._compact_session_locked(session)
 
-    async def _compact_locked(self):
-        obsolete = [ticket for ticket in self._released if self._acknowledged(ticket)]
+    async def _compact_session_locked(self, session):
+        watermark = self._sessions.get(session, 0)
+        obsolete = [
+            n for n in self._released_by_session.get(session, ()) if n <= watermark
+        ]
         for offset in range(0, len(obsolete), 32):
             await self._commit(
                 [
-                    ("permit/" + ticket, None)
-                    for ticket in obsolete[offset : offset + 32]
+                    (f"permit/{session}:{number}", None)
+                    for number in obsolete[offset : offset + 32]
                 ]
             )
 
@@ -180,12 +297,7 @@ class QueueController:
         self, job_id, resources, *, quota_namespace=NAMESPACE, admin_token=None
     ):
         self.check_admin(admin_token)
-        if (
-            not isinstance(job_id, str)
-            or not job_id
-            or not isinstance(quota_namespace, str)
-            or not quota_namespace
-        ):
+        if not job_id or not quota_namespace:
             raise ValueError("job_id and quota_namespace must be nonempty strings")
         if resources is not None:
             self._validate(resources)
@@ -197,7 +309,10 @@ class QueueController:
                         quota_key(key),
                         None
                         if resources is None
-                        else {"key": list(key), "resources": dict(resources)},
+                        else {
+                            "key": list(key),
+                            "resources": dict(resources),
+                        },
                     )
                 ]
             )
@@ -207,105 +322,167 @@ class QueueController:
                 self._quotas[key] = dict(resources)
         self._schedule_drain()
 
-    async def acquire(self, request, ticket):
+    def _ticket_state(self, ticket):
+        if ticket in self._released or self._acknowledged(ticket):
+            return "TERMINAL"
+        if ticket in self._permits:
+            return self._records["permit/" + ticket]["state"]
+        if ticket in self._waiting_tickets:
+            return "WAITING"
+        return "NOT_REGISTERED"
+
+    async def enqueue(self, request, ticket):
+        self._rpc_counts["enqueue"] += 1
         resources = self._validate(request["resources"])
         key = (request.get("quota_namespace", NAMESPACE), request["job_id"])
         if not request.get("trackable", True) and resources:
             raise ValueError("Resource accounting requires positive fixed returns")
         async with self._lock:
-            self._ensure_writable()
+            self._ensure_ready()
             parts = ticket_parts(ticket)
             if parts and parts[0] not in self._sessions:
                 raise ValueError("Unknown session")
-            if ticket in self._released or self._acknowledged(ticket):
-                raise ValueError("Ticket has already been released or acknowledged")
+            state = self._ticket_state(ticket)
+            if state == "TERMINAL":
+                return {"state": state, "incarnation": self._incarnation}
             if ticket in self._permits:
                 if self._permits[ticket] != (key, resources):
                     raise ValueError("Ticket reused for a different request")
-                return True
-            if request["kind"] == "actor_method":
+                return {"state": state, "incarnation": self._incarnation}
+            if request["kind"] == "actor_method" or not resources:
                 self._counts[request["kind"]] += 1
-                return True
-            if ticket in self._pending:
-                if self._requests[ticket] != (key, resources):
+                return {"state": "UNMETERED", "incarnation": self._incarnation}
+            if ticket in self._waiting_tickets:
+                existing = self._waiting_tickets[ticket]
+                if existing[:2] != (key, resources):
                     raise ValueError("Ticket reused for a different request")
-                future = self._pending[ticket]
             else:
-                future = asyncio.get_running_loop().create_future()
-                self._pending[ticket] = future
-                self._requests[ticket] = (key, resources)
-                self._waiting.setdefault(key, deque()).append(
-                    (ticket, request, resources, future)
-                )
+                if len(self._waiting_tickets) >= MAX_WAITING:
+                    raise RuntimeError("Queue overloaded")
+                waiting = self._waiting.setdefault(key, deque())
+                if len(waiting) >= MAX_WAITING_PER_KEY:
+                    raise RuntimeError("Job queue overloaded")
+                item = (ticket, request, resources)
+                waiting.append(item)
+                self._waiting_tickets[ticket] = (key, resources, request)
         self._schedule_drain()
-        try:
-            return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            await self.release(ticket)
-            raise
-        finally:
-            if future.done():
-                if not future.cancelled():
-                    future.exception()
-                self._pending.pop(ticket, None)
-                self._requests.pop(ticket, None)
+        return {"state": self._ticket_state(ticket), "incarnation": self._incarnation}
+
+    def inspect(self, ticket):
+        self._rpc_counts["inspect"] += 1
+        return {
+            "state": self._ticket_state(ticket),
+            "incarnation": self._incarnation,
+            "retry_after": 0.02,
+        }
+
+    async def begin_submit(self, ticket):
+        self._rpc_counts["begin_submit"] += 1
+        async with self._lock:
+            self._ensure_ready()
+            state = self._ticket_state(ticket)
+            if state == "SUBMITTING":
+                return state
+            if state != "RESERVED":
+                raise ValueError(f"Ticket is {state}, expected RESERVED")
+            await self._commit(
+                [
+                    (
+                        "permit/" + ticket,
+                        {
+                            **self._records["permit/" + ticket],
+                            "state": "SUBMITTING",
+                            "protocol": PROTOCOL_VERSION,
+                        },
+                    )
+                ]
+            )
+            return "SUBMITTING"
 
     def _schedule_drain(self):
-        if self._drainer is None or self._drainer.done():
+        if self._recovery_state == "READY" and (
+            self._drainer is None or self._drainer.done()
+        ):
             self._drainer = asyncio.create_task(self._drain())
 
     async def _drain(self):
+        budget = 32
         try:
             async with self._lock:
-                self._ensure_writable()
+                self._ensure_ready()
+                budget = 32
                 for key, waiting in list(self._waiting.items()):
-                    while waiting:
-                        selected = []
-                        projected = self._usage.get(key, Counter()).copy()
-                        for item in waiting:
-                            ticket, request, resources, future = item
-                            if future.done():
-                                selected.append(item)
-                            else:
-                                if any(
-                                    projected[r] + resources.get(r, 0) > limit + 1e-9
-                                    for r, limit in self._quotas.get(key, {}).items()
-                                ):
-                                    break
-                                projected.update(resources)
-                                selected.append(item)
-                            if len(selected) == 32:
-                                break
-                        if not selected:
+                    selected = []
+                    projected = self._usage.get(key, Counter()).copy()
+                    for ticket, request, resources in waiting:
+                        if not budget:
                             break
-                        changes = [
-                            (
-                                "permit/" + ticket,
-                                {
-                                    "state": "RESERVED",
-                                    "key": list(key),
-                                    "resources": resources,
-                                },
-                            )
-                            for ticket, _, resources, future in selected
-                            if resources and not future.done()
-                        ]
-                        if changes:
-                            await self._commit(changes)
-                        for ticket, request, _, future in selected:
+                        if any(
+                            projected[r] + resources.get(r, 0) > limit + 1e-9
+                            for r, limit in self._quotas.get(key, {}).items()
+                        ):
+                            break
+                        selected.append((ticket, request, resources))
+                        projected.update(resources)
+                        budget -= 1
+                    if selected:
+                        await self._commit(
+                            [
+                                (
+                                    "permit/" + ticket,
+                                    {
+                                        "state": "RESERVED",
+                                        "key": list(key),
+                                        "resources": resources,
+                                        "protocol": PROTOCOL_VERSION,
+                                    },
+                                )
+                                for ticket, _, resources in selected
+                            ]
+                        )
+                        for ticket, request, _ in selected:
                             waiting.popleft()
-                            if not future.done():
-                                self._counts[request["kind"]] += 1
-                                future.set_result(True)
+                            self._waiting_tickets.pop(ticket, None)
+                            self._counts[request["kind"]] += 1
                     if not waiting:
-                        del self._waiting[key]
-        except Exception as error:
-            # _commit already poisons the controller on ambiguous writes.
-            for future in self._pending.values():
-                if not future.done():
-                    future.set_exception(error)
+                        self._waiting.pop(key, None)
+                    if not budget:
+                        break
+        except Exception:
+            pass
+        self._drainer = None
+        if self._waiting_tickets and budget == 0:
+            await asyncio.sleep(0)
+            self._schedule_drain()
 
-    async def _release_locked(self, tickets):
+    async def cancel(self, ticket):
+        self._rpc_counts["cancel"] += 1
+        async with self._lock:
+            self._ensure_ready()
+            if ticket in self._waiting_tickets:
+                await self._release_locked([ticket])
+                key, _, _ = self._waiting_tickets.pop(ticket)
+                self._waiting[key] = deque(
+                    x for x in self._waiting[key] if x[0] != ticket
+                )
+                if not self._waiting[key]:
+                    del self._waiting[key]
+                return "TERMINAL"
+            state = self._ticket_state(ticket)
+            if state == "RESERVED":
+                await self._release_locked([ticket])
+                return "TERMINAL"
+            if state in ("SUBMITTING", "TRACKED"):
+                return "SUBMISSION_UNKNOWN"
+            if state == "NOT_REGISTERED":
+                await self._release_locked([ticket])
+                return "TERMINAL"
+            return state
+
+    def _records_ticket_set(self):
+        return {key[7:] for key in self._records if key.startswith("permit/")}
+
+    async def _release_locked(self, tickets, *, actor_id=None):
         changes = []
         for ticket in tickets:
             if ticket in self._released:
@@ -315,27 +492,41 @@ class QueueController:
                     continue
                 value = None
             else:
-                value = {"state": "RELEASED"}
+                old = self._records.get("permit/" + ticket, {})
+                value = {
+                    "state": "RELEASED",
+                    "protocol": PROTOCOL_VERSION,
+                    "refs": old.get("refs", []),
+                    "actor_id": actor_id or old.get("actor_id"),
+                }
             changes.append(("permit/" + ticket, value))
         for offset in range(0, len(changes), 32):
             await self._commit(changes[offset : offset + 32])
-        for ticket in tickets:
-            future = self._pending.get(ticket)
-            if future is not None and not future.done():
-                future.cancel()
 
     async def release(self, ticket):
+        """Release only tracked/completed work; use cancel before submission."""
+        self._rpc_counts["release"] += 1
         async with self._lock:
-            self._ensure_writable()
+            state = self._ticket_state(ticket)
+            if state == "SUBMITTING":
+                raise ValueError("Submission outcome unknown; reconciliation required")
             await self._release_locked([ticket])
         self._schedule_drain()
 
     async def track(self, ticket, refs):
+        self._rpc_counts["track"] += 1
         refs = set(refs)
         async with self._lock:
-            self._ensure_writable()
+            self._ensure_ready()
             if ticket not in self._permits:
-                return
+                record = self._records.get("permit/" + ticket, {})
+                saved = {
+                    ray.cloudpickle.loads(base64.b64decode(v))
+                    for v in record.get("refs", [])
+                }
+                if record.get("state") == "RELEASED" and saved and saved == refs:
+                    return "TRACKED_COMPLETED"
+                raise ValueError("Unknown permit")
             if ticket in self._actors or (
                 ticket in self._tracked and self._tracked[ticket] != refs
             ):
@@ -361,10 +552,17 @@ class QueueController:
         self._start_monitor()
 
     async def track_actor(self, ticket, actor_id):
+        self._rpc_counts["track_actor"] += 1
         async with self._lock:
-            self._ensure_writable()
+            self._ensure_ready()
             if ticket not in self._permits:
-                return
+                record = self._records.get("permit/" + ticket, {})
+                if (
+                    record.get("state") == "RELEASED"
+                    and record.get("actor_id") == actor_id
+                ):
+                    return "TRACKED_COMPLETED"
+                raise ValueError("Unknown permit")
             if ticket in self._tracked or (
                 ticket in self._actors and self._actors[ticket] != actor_id
             ):
@@ -372,7 +570,7 @@ class QueueController:
             if ticket in self._actors:
                 return
             if actor_id in self._actors.values():
-                await self._release_locked([ticket])
+                await self._release_locked([ticket], actor_id=actor_id)
             else:
                 await self._commit(
                     [
@@ -396,7 +594,7 @@ class QueueController:
     async def _watch_completions(self):
         delay = 0.1
         while self._tracked or self._actors or self._released:
-            if self._storage_error is not None:
+            if self._recovery_state != "READY":
                 return
             try:
                 await self._poll_completions()
@@ -421,23 +619,42 @@ class QueueController:
                 ray.wait, refs, num_returns=len(refs), timeout=0, fetch_local=False
             )
             ready = set(ready)
-        states = await asyncio.to_thread(actors) if actor_ids else {}
-        completed = [
-            ticket for ticket, pending in tracked.items() if pending.issubset(ready)
-        ]
+        if actor_ids and time.monotonic() - self._last_actor_poll >= 1:
+            identifiers = list(actor_ids.values())
+            count = min(64, len(identifiers))
+            start = self._actor_poll_cursor % len(identifiers)
+            selected = [
+                identifiers[(start + offset) % len(identifiers)]
+                for offset in range(count)
+            ]
+
+            def query_selected():
+                result = {}
+                for actor_id in selected:
+                    info = actors(actor_id=actor_id)
+                    if info:
+                        result[actor_id] = info
+                return result
+
+            self._actor_states.update(await asyncio.to_thread(query_selected))
+            self._actor_poll_cursor = start + count
+            self._last_actor_poll = time.monotonic()
+        states = self._actor_states
+        completed = [t for t, pending in tracked.items() if pending.issubset(ready)]
         completed += [
-            ticket
-            for ticket, actor_id in actor_ids.items()
+            t
+            for t, actor_id in actor_ids.items()
             if states.get(actor_id, {}).get("State") == "DEAD"
         ]
         async with self._lock:
-            self._ensure_writable()
             await self._release_locked(completed)
-            await self._compact_locked()
+            for session in list(self._released_by_session):
+                await self._compact_session_locked(session)
         if completed:
             self._schedule_drain()
 
     def snapshot(self):
+        self._ensure_ready()
         return dict(self._counts)
 
     def status(self):
@@ -451,7 +668,15 @@ class QueueController:
             "health": {
                 "storage_error": self._storage_error,
                 "monitor_error": self._monitor_error,
-                "accepting": self._storage_error is None,
+                "accepting": self._recovery_state == "READY",
+                "recovery_state": self._recovery_state,
+                "incarnation": self._incarnation,
+                "recovery_attempts": self._recovery_attempts,
+                "last_recovery_seconds": self._last_recovery_seconds,
+                "last_successful_commit": self._last_successful_commit,
+                "writer_inflight": self._writer.requests.qsize(),
+                "monitor_running": self._monitor is not None
+                and not self._monitor.done(),
             },
             "storage": {
                 "backend": "gcs-kv",
@@ -461,6 +686,7 @@ class QueueController:
                 "released_records": len(self._released),
                 "sessions": len(self._sessions),
             },
+            "rpc_counts": dict(self._rpc_counts),
             "quotas": nested(self._quotas),
             "usage": nested(self._usage),
             "permits": [
@@ -481,8 +707,6 @@ class QueueController:
                     "quota_namespace": key[0],
                     "resources": dict(resources),
                 }
-                for key, waiting in self._waiting.items()
-                for ticket, request, resources, future in waiting
-                if not future.done()
+                for ticket, (key, resources, request) in self._waiting_tickets.items()
             ],
         }

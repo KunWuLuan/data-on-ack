@@ -69,6 +69,7 @@ import json
 import math
 import os
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 
@@ -76,6 +77,7 @@ import ray
 from ray.actor import ActorClass, ActorHandle
 from ray.remote_function import RemoteFunction
 from ray_admission._controller import QueueController as _QueueController
+from ray_admission._controller import ServiceRecovering
 
 _NAME = "ray-submission-queue"
 _NAMESPACE = "ray-submission-queue"
@@ -91,7 +93,38 @@ _session_sequence = 0
 _session_watermark = 0
 _session_done = set()
 _session_opened = False
+_ack_timer = None
+_ack_controller = None
+_ack_states = {}
+_ack_enabled = True
+_submissions = {}
+_MAX_UNRESOLVED_SUBMISSIONS = 1024
 DESCRIPTION = "Per-Job resource quota and FIFO submission queue"
+
+
+class SubmissionOutcomeUnknown(RuntimeError):
+    """Ray submission was entered and may have created work."""
+
+    def __init__(self, ticket, phase, cause):
+        super().__init__(
+            f"Submission outcome unknown for {ticket} during {phase}: {cause}"
+        )
+        self.ticket = ticket
+        self.phase = phase
+        self.cause = cause
+
+
+class SubmissionTrackingError(RuntimeError):
+    """Execution exists, but its durable permit tracking did not complete."""
+
+    def __init__(self, ticket, handle, cause):
+        super().__init__(f"Submission {ticket} succeeded but tracking failed: {cause}")
+        self.ticket = ticket
+        self.handle = handle
+        self.cause = cause
+
+    def retry_tracking(self):
+        return retry_tracking(self.ticket)
 
 
 def _next_ticket():
@@ -106,21 +139,144 @@ def _next_ticket():
 
 
 def _ack_ticket(controller, ticket):
-    global _session_watermark
     session, sequence = ticket.split(":")
+    key = (controller._ray_actor_id.hex(), session)
     with _lock:
-        _session_done.add(int(sequence))
-        while _session_watermark + 1 in _session_done:
-            _session_watermark += 1
-            _session_done.remove(_session_watermark)
-        watermark = _session_watermark
+        state = _ack_states.setdefault(
+            key,
+            dict(
+                controller=controller,
+                watermark=0,
+                done=set(),
+                timer=None,
+                inflight=False,
+                sent=0,
+            ),
+        )
+        if int(sequence) > state["watermark"]:
+            state["done"].add(int(sequence))
+        while state["watermark"] + 1 in state["done"]:
+            state["watermark"] += 1
+            state["done"].remove(state["watermark"])
+        _schedule_ack(key, state, 0.05)
+
+
+def _schedule_ack(key, state, delay):
+    if (
+        _ack_enabled
+        and state["timer"] is None
+        and not state["inflight"]
+        and state["sent"] < state["watermark"]
+    ):
+        timer = threading.Timer(delay, _flush_ack, args=(key,))
+        timer.daemon = True
+        state["timer"] = timer
+        timer.start()
+
+
+def _flush_ack(key=None, *, deadline=None):
+    if key is None:
+        with _lock:
+            keys = list(_ack_states)
+        for item in keys:
+            _flush_ack(item)
+        return
+    with _lock:
+        if not _ack_enabled and deadline is None:
+            return
+        if deadline is not None and time.monotonic() >= deadline:
+            return
+        state = _ack_states[key]
+        if state["inflight"]:
+            return
+        if state["timer"] is not None:
+            state["timer"].cancel()
+        state["timer"] = None
+        if state["sent"] >= state["watermark"]:
+            return
+        state["inflight"] = True
+        controller, watermark = state["controller"], state["watermark"]
+    succeeded = False
     try:
         with _bypass():
-            ray.get(controller.acknowledge.remote(session, watermark), timeout=10)
+            timeout = 10 if deadline is None else max(0, deadline - time.monotonic())
+            ray.get(controller.acknowledge.remote(key[1], watermark), timeout=timeout)
+        succeeded = True
     except Exception:
-        # A lost acknowledgment only delays compaction; the next completed
-        # submission resends the cumulative watermark.
         pass
+    finally:
+        with _lock:
+            state["inflight"] = False
+            if succeeded:
+                state["sent"] = watermark
+            _schedule_ack(key, state, 0.05 if succeeded else 0.5)
+
+
+def _wait_for_reservation(controller, request, ticket):
+    """Use only short actor calls; waiting lives in the client process."""
+    delay = 0.01
+    while True:
+        try:
+            with _bypass():
+                result = ray.get(controller.enqueue.remote(request, ticket))
+        except ServiceRecovering:
+            time.sleep(delay)
+            delay = min(delay * 1.5, 0.25)
+            continue
+        state = result["state"]
+        if state in ("RESERVED", "UNMETERED"):
+            return state
+        if state == "TERMINAL":
+            raise RuntimeError("Admission ticket is already terminal")
+        if state not in ("WAITING", "NOT_REGISTERED"):
+            raise RuntimeError(f"Unexpected admission state: {state}")
+        time.sleep(delay)
+        delay = min(delay * 1.5, 0.25)
+
+
+def get_submission(ticket):
+    """Return the process-local association for a submitted ticket, if retained."""
+    with _lock:
+        value = _submissions.get(ticket)
+        return None if value is None else dict(value)
+
+
+def _begin_submit(controller, ticket):
+    delay = 0.01
+    while True:
+        try:
+            with _bypass():
+                return ray.get(controller.begin_submit.remote(ticket))
+        except ServiceRecovering:
+            time.sleep(delay)
+            delay = min(delay * 1.5, 0.25)
+
+
+def retry_tracking(ticket):
+    """Retry durable tracking without resubmitting the user's task or actor."""
+    with _lock:
+        entry = _submissions.get(ticket)
+    if entry is None or entry.get("handle") is None:
+        raise ValueError("No process-local execution handle for ticket")
+    controller = entry["controller"]
+    handle = entry["handle"]
+    try:
+        with _bypass():
+            if entry["kind"] == "task":
+                refs = [handle] if isinstance(handle, ray.ObjectRef) else handle
+                ray.get(controller.track.remote(ticket, refs))
+            else:
+                ray.get(
+                    controller.track_actor.remote(ticket, handle._ray_actor_id.hex())
+                )
+    except Exception as error:
+        with _lock:
+            entry["last_error"] = str(error)
+        raise SubmissionTrackingError(ticket, handle, error) from error
+    with _lock:
+        _submissions.pop(ticket, None)
+    _ack_ticket(controller, ticket)
+    return handle
 
 
 def _current_quota_namespace():
@@ -318,40 +474,93 @@ def _wrap(original, kind):
                         )
                 ticket = _next_ticket()
                 try:
+                    state = _wait_for_reservation(controller, request, ticket)
+                except BaseException as error:
+                    try:
+                        deadline = time.monotonic() + 10
+                        while True:
+                            try:
+                                with _bypass():
+                                    cancelled = ray.get(
+                                        controller.cancel.remote(ticket), timeout=2
+                                    )
+                                if cancelled == "TERMINAL":
+                                    _ack_ticket(controller, ticket)
+                                break
+                            except Exception:
+                                if time.monotonic() >= deadline:
+                                    raise
+                                time.sleep(0.1)
+                    except Exception:
+                        error.add_note(f"Cancellation outcome unknown; ticket={ticket}")
+                    raise
+                if state == "UNMETERED":
+                    try:
+                        return (
+                            original(*bound.args, **bound.kwargs)
+                            if bound is not None
+                            else original(target, *args, **kwargs)
+                        )
+                    finally:
+                        _ack_ticket(controller, ticket)
+                # Catch argument serialization errors before the durable
+                # SUBMITTING boundary. Once the original Ray call begins, an
+                # exception is conservatively treated as an unknown outcome.
+                try:
+                    ray.cloudpickle.dumps((args, kwargs))
+                except BaseException:
                     with _bypass():
-                        allowed = ray.get(controller.acquire.remote(request, ticket))
-                    if allowed is not True:
-                        raise PermissionError("Submission rejected by queue controller")
+                        ray.get(controller.cancel.remote(ticket), timeout=10)
+                    _ack_ticket(controller, ticket)
+                    raise
+                with _lock:
+                    unresolved_full = len(_submissions) >= _MAX_UNRESOLVED_SUBMISSIONS
+                if unresolved_full:
+                    with _bypass():
+                        ray.get(controller.cancel.remote(ticket), timeout=10)
+                    _ack_ticket(controller, ticket)
+                    raise RuntimeError(
+                        "Too many unresolved submissions; reconcile them before submitting"
+                    )
+                _begin_submit(controller, ticket)
+                try:
                     if bound is not None:
                         result = original(*bound.args, **bound.kwargs)
                     else:
                         result = original(target, *args, **kwargs)
-                except BaseException:
-                    # Includes interrupted admission and local serialization errors.
-                    # A failed controller must not obscure the original exception.
-                    try:
-                        with _bypass():
-                            ray.get(controller.release.remote(ticket), timeout=5)
-                        _ack_ticket(controller, ticket)
-                    except Exception:
-                        pass
+                except (KeyboardInterrupt, SystemExit) as error:
+                    with _lock:
+                        _submissions[ticket] = {
+                            "controller": controller,
+                            "kind": kind,
+                            "handle": None,
+                            "tracking_state": "SUBMISSION_UNKNOWN",
+                            "last_error": repr(error),
+                        }
+                    error.add_note(f"Ray submission outcome unknown; ticket={ticket}")
                     raise
+                except BaseException as error:
+                    with _lock:
+                        _submissions[ticket] = {
+                            "controller": controller,
+                            "kind": kind,
+                            "handle": None,
+                            "tracking_state": "SUBMISSION_UNKNOWN",
+                            "last_error": repr(error),
+                        }
+                    raise SubmissionOutcomeUnknown(
+                        ticket, "ray-submit", error
+                    ) from error
                 if request["resources"]:
-                    with _bypass():
-                        if kind == "task":
-                            refs = (
-                                [result]
-                                if isinstance(result, ray.ObjectRef)
-                                else result
-                            )
-                            ray.get(controller.track.remote(ticket, refs))
-                        elif kind == "actor_creation":
-                            ray.get(
-                                controller.track_actor.remote(
-                                    ticket, result._ray_actor_id.hex()
-                                )
-                            )
-                _ack_ticket(controller, ticket)
+                    with _lock:
+                        _submissions[ticket] = {
+                            "controller": controller,
+                            "kind": kind,
+                            "handle": result,
+                            "tracking_state": "PENDING",
+                            "last_error": None,
+                        }
+                    return retry_tracking(ticket)
                 return result
         return original(target, *args, **kwargs)
 
@@ -389,6 +598,11 @@ def start(*, admin_token):
         )
         # Existing queues retain their credentials; start cannot replace them.
         ray.get(controller.check_admin.remote(admin_token))
+        health = ray.get(controller.status.remote())["health"]
+        if health["recovery_state"] != "READY":
+            raise RuntimeError(
+                "Existing queue is unhealthy; run ray-admission queue recover"
+            )
     return controller
 
 
@@ -433,7 +647,7 @@ def enable_admission():
 
 
 def _install(controller, quota_namespace):
-    global _controller, _identity, _quota_namespace
+    global _controller, _identity, _quota_namespace, _ack_enabled
     global _session_sequence, _session_watermark, _session_opened
     if _controller is not None:
         if _quota_namespace != quota_namespace:
@@ -456,6 +670,9 @@ def _install(controller, quota_namespace):
     _identity = (quota_namespace, session)
     _quota_namespace = quota_namespace
     _controller = controller
+    _ack_enabled = True
+    for key, state in _ack_states.items():
+        _schedule_ack(key, state, 0.05)
 
 
 def disable_admission():
@@ -465,8 +682,23 @@ def disable_admission():
     Call before ``ray.shutdown()``. Enabling/disabling admission during concurrent
     submissions is not supported.
     """
-    global _controller, _identity, _quota_namespace
+    global \
+        _controller, \
+        _identity, \
+        _quota_namespace, \
+        _ack_timer, \
+        _ack_controller, \
+        _ack_enabled
     with _lock:
+        _ack_enabled = False
+        for state in _ack_states.values():
+            if state["timer"] is not None:
+                state["timer"].cancel()
+                state["timer"] = None
+        if _ack_timer is not None:
+            _ack_timer.cancel()
+            _ack_timer = None
+        _ack_controller = None
         _controller = None
         _identity = None
         _quota_namespace = None
@@ -475,6 +707,12 @@ def disable_admission():
                 setattr(cls, method, original)
         _originals.clear()
         _runtime_env_cache.clear()
+        keys = list(_ack_states)
+    # One shared budget, not one timeout per session. Background callbacks
+    # remain disabled even when this final best-effort delivery fails.
+    deadline = time.monotonic() + 2
+    for key in keys:
+        _flush_ack(key, deadline=deadline)
 
 
 def _cli_resources(value):
@@ -501,6 +739,7 @@ def register_cli(parser):
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("start", help="Start or authenticate to the detached queue")
+    commands.add_parser("recover", help="Recover an unhealthy queue storage writer")
     commands.add_parser("status", help="Show quotas, usage, and waiting requests")
     quota = commands.add_parser("quota", help="Manage per-Job quotas")
     quota_commands = quota.add_subparsers(dest="quota_command", required=True)
@@ -526,6 +765,13 @@ def run_cli(args):
             controller = ray.get_actor(_NAME, namespace=_NAMESPACE)
             if args.command == "status":
                 print(json.dumps(ray.get(controller.status.remote()), indent=2))
+            elif args.command == "recover":
+                state = ray.get(
+                    controller.recover.remote(admin_token=_cli_token(args)), timeout=45
+                )
+                print(json.dumps({"recovery_state": state}))
+                if state != "READY":
+                    raise RuntimeError(f"Queue recovery ended in {state}")
             else:
                 resources = args.resources if args.quota_command == "set" else None
                 quota_namespace = _current_quota_namespace()

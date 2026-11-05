@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import ray
+from ray.remote_function import RemoteFunction
 from ray_admission import queue
 from gcs_test_support import configure_storage
 
@@ -62,6 +63,21 @@ def status(controller):
     state["quotas"] = state["quotas"].get(queue._NAMESPACE, {})
     state["usage"] = state["usage"].get(queue._NAMESPACE, {})
     return state
+
+
+def enqueue(controller, request, ticket):
+    return ray.get(controller.enqueue.remote(request, ticket))
+
+
+def reserve(controller, request, ticket):
+    enqueue(controller, request, ticket)
+    wait_until(
+        lambda: any(
+            item["ticket"] == ticket
+            for item in ray.get(controller.status.remote())["permits"]
+        )
+    )
+    return True
 
 
 class AutoStartTest(unittest.TestCase):
@@ -129,6 +145,37 @@ class SubmissionQueueTest(unittest.TestCase):
         self.controller = queue.start(admin_token=self.admin_token)
         self.assertEqual(status(self.controller)["quotas"], {"saved-job": {"CPU": 2}})
 
+    def test_two_thousand_waiters_do_not_exhaust_management_calls(self):
+        controller = queue.start(admin_token=self.admin_token)
+        self.controller = controller
+        request = {
+            "kind": "task",
+            "name": "pressure",
+            "job_id": "pressure-job",
+            "resources": {"CPU": 1},
+        }
+        ray.get(
+            controller.set_job_quota.remote(
+                "pressure-job", {"CPU": 0}, admin_token=self.admin_token
+            )
+        )
+        replies = ray.get(
+            [
+                controller.enqueue.remote(request, f"pressure-{index}")
+                for index in range(2000)
+            ],
+            timeout=30,
+        )
+        self.assertTrue(all(reply["state"] == "WAITING" for reply in replies))
+        self.assertEqual(len(ray.get(controller.status.remote())["waiting"]), 2000)
+        ray.get(
+            controller.set_job_quota.remote(
+                "pressure-job", {"CPU": 2000}, admin_token=self.admin_token
+            ),
+            timeout=10,
+        )
+        wait_until(lambda: len(ray.get(controller.status.remote())["permits"]) == 2000)
+
     def test_running_task_permit_survives_automatic_restart(self):
         gate = _Gate.remote()
 
@@ -195,7 +242,7 @@ class SubmissionQueueTest(unittest.TestCase):
             "job_id": job_id,
             "resources": {"CPU": 0.5},
         }
-        ray.get(controller.acquire.remote(request, ticket))
+        reserve(controller, request, ticket)
         ray.get(controller.track_actor.remote(ticket, actor._ray_actor_id.hex()))
         ray.kill(controller)
         wait_until(lambda: controller_is_absent(queue._NAMESPACE))
@@ -290,9 +337,7 @@ class SubmissionQueueTest(unittest.TestCase):
                                 target, resources, admin_token=credentials
                             )
                         )
-        self.assertEqual(
-            status(controller)["quotas"], {"protected-job": {"CPU": 1}}
-        )
+        self.assertEqual(status(controller)["quotas"], {"protected-job": {"CPU": 1}})
         ray.get(
             controller.set_job_quota.remote(
                 "protected-job", None, admin_token=self.admin_token
@@ -365,15 +410,10 @@ class SubmissionQueueTest(unittest.TestCase):
             "job_id": "same-job",
             "resources": {"CPU": 1},
         }
-        blocked = controller.acquire.remote(
-            {**request, "quota_namespace": "team-a"}, "blocked"
-        )
+        blocked_request = {**request, "quota_namespace": "team-a"}
+        enqueue(controller, blocked_request, "blocked")
         self.assertTrue(
-            ray.get(
-                controller.acquire.remote(
-                    {**request, "quota_namespace": "team-b"}, "allowed"
-                )
-            )
+            reserve(controller, {**request, "quota_namespace": "team-b"}, "allowed")
         )
         state = ray.get(controller.status.remote())
         self.assertEqual(state["quotas"]["team-a"]["same-job"], {"CPU": 0})
@@ -388,7 +428,7 @@ class SubmissionQueueTest(unittest.TestCase):
                 admin_token=self.admin_token,
             )
         )
-        self.assertTrue(ray.get(blocked))
+        self.assertTrue(reserve(controller, blocked_request, "blocked"))
         ray.get(controller.release.remote("blocked"))
 
     def test_environment_namespace_reaches_actor_workers(self):
@@ -536,11 +576,7 @@ class SubmissionQueueTest(unittest.TestCase):
             self.assertEqual(sorted(entered[:quota]), list(range(quota)))
             self.assertEqual(entered[quota:], [quota, quota + 1])
             self.assertEqual(peak, quota)
-            wait_until(
-                lambda: not any(
-                    status(controller)["usage"][job_id].values()
-                )
-            )
+            wait_until(lambda: not any(status(controller)["usage"][job_id].values()))
         finally:
             for index in range(quota + 2):
                 ray.get(gate.open.remote(index))
@@ -578,11 +614,64 @@ class SubmissionQueueTest(unittest.TestCase):
         with self.assertRaises((TypeError, ValueError)):
             work.remote(Unserializable())
         self.assertEqual(ray.get(work.remote(5)), [5, 6])
-        wait_until(
-            lambda: not any(
-                status(controller)["usage"][job_id].values()
+        wait_until(lambda: not any(status(controller)["usage"][job_id].values()))
+
+    def test_unknown_submit_outcome_keeps_quota_until_execution_is_tracked(self):
+        @ray.remote(num_cpus=1)
+        def work():
+            return "executed"
+
+        controller = self.enable_admission()
+        job_id = ray.get_runtime_context().get_job_id()
+        ray.get(
+            controller.set_job_quota.remote(
+                job_id, {"CPU": 1}, admin_token=self.admin_token
             )
         )
+        original = queue._originals[(RemoteFunction, "_remote")][0]
+        handles = []
+
+        def submit_then_lose_reply(target, args=None, kwargs=None, **task_options):
+            handle = original(target, args=args, kwargs=kwargs, **task_options)
+            handles.append(handle)
+            raise OSError("reply lost after Ray accepted work")
+
+        wrapped = queue._wrap(submit_then_lose_reply, "task")
+        with self.assertRaises(queue.SubmissionOutcomeUnknown) as raised:
+            wrapped(work, args=(), kwargs={})
+        ticket = raised.exception.ticket
+        self.assertEqual(ray.get(handles[0]), "executed")
+        self.assertEqual(status(controller)["usage"][job_id], {"CPU": 1})
+        permit = next(p for p in status(controller)["permits"] if p["ticket"] == ticket)
+        self.assertEqual(permit["state"], "SUBMITTING")
+        ray.get(controller.track.remote(ticket, handles))
+        wait_until(lambda: status(controller)["usage"][job_id]["CPU"] == 0)
+
+    def test_tracking_error_exposes_original_handle_for_retry(self):
+        class Method:
+            def remote(self, *args):
+                return args
+
+        class Controller:
+            track = Method()
+
+        ticket = "local:1"
+        handle = [object()]
+        queue._submissions[ticket] = {
+            "controller": Controller(),
+            "kind": "task",
+            "handle": handle,
+            "tracking_state": "PENDING",
+            "last_error": None,
+        }
+        self.addCleanup(queue._submissions.pop, ticket, None)
+        with patch.object(
+            queue.ray, "get", side_effect=OSError("tracking unavailable")
+        ):
+            with self.assertRaises(queue.SubmissionTrackingError) as raised:
+                queue.retry_tracking(ticket)
+        self.assertIs(raised.exception.handle, handle)
+        self.assertEqual(queue.get_submission(ticket)["tracking_state"], "PENDING")
 
     def test_invalid_quota(self):
         controller = self.enable_admission()
@@ -616,34 +705,35 @@ class SubmissionQueueTest(unittest.TestCase):
             )
         )
 
-        def acquire(job, name, resources, ticket):
-            return controller.acquire.remote(
-                {
-                    "kind": "task",
-                    "name": name,
-                    "job_id": job,
-                    "resources": resources,
-                    "metadata": {},
-                },
-                ticket,
-            )
+        def request(job, name, resources):
+            return {
+                "kind": "task",
+                "name": name,
+                "job_id": job,
+                "resources": resources,
+                "metadata": {},
+            }
 
         self.assertTrue(
-            ray.get(acquire("job-a", "op1", {"CPU": 0.5, "GPU": 0.5}, "a0"))
+            reserve(controller, request("job-a", "op1", {"CPU": 0.5, "GPU": 0.5}), "a0")
         )
-        a1 = acquire("job-a", "op2", {"CPU": 0.5, "GPU": 0.5}, "a1")
+        enqueue(controller, request("job-a", "op2", {"CPU": 0.5, "GPU": 0.5}), "a1")
         wait_until(lambda: len(status(controller)["waiting"]) == 1)
         # A CPU-only request would fit but must not overtake the same job's head.
-        a2 = acquire("job-a", "op3", {"CPU": 0.5}, "a2")
+        enqueue(controller, request("job-a", "op3", {"CPU": 0.5}), "a2")
         wait_until(lambda: len(status(controller)["waiting"]) == 2)
-        self.assertTrue(ray.get(acquire("job-b", "op1", {"CPU": 2}, "b0")))
-        self.assertEqual(ray.wait([a1, a2], timeout=0)[0], [])
+        self.assertTrue(reserve(controller, request("job-b", "op1", {"CPU": 2}), "b0"))
         state = status(controller)
         self.assertEqual(state["usage"]["job-a"], {"CPU": 0.5, "GPU": 0.5})
         self.assertEqual(state["usage"]["job-b"], {"CPU": 2})
         self.assertEqual([item["ticket"] for item in state["waiting"]], ["a1", "a2"])
         ray.get(controller.release.remote("a0"))
-        self.assertEqual(ray.get([a1, a2]), [True, True])
+        self.assertTrue(
+            reserve(controller, request("job-a", "op2", {"CPU": 0.5, "GPU": 0.5}), "a1")
+        )
+        self.assertTrue(
+            reserve(controller, request("job-a", "op3", {"CPU": 0.5}), "a2")
+        )
         self.assertEqual(
             status(controller)["usage"]["job-a"],
             {"CPU": 1, "GPU": 0.5},
@@ -660,34 +750,32 @@ class SubmissionQueueTest(unittest.TestCase):
             "resources": {"CPU": 1},
             "metadata": {},
         }
-        self.assertTrue(ray.get(controller.acquire.remote(request, "first")))
+        self.assertTrue(reserve(controller, request, "first"))
         ray.get(
             controller.set_job_quota.remote(
                 "job", {"CPU": 0}, admin_token=self.admin_token
             )
         )
-        pending = controller.acquire.remote(request, "second")
+        enqueue(controller, request, "second")
         wait_until(lambda: len(status(controller)["waiting"]) == 1)
-        self.assertEqual(
-            status(controller)["usage"]["job"], {"CPU": 1}
-        )
+        self.assertEqual(status(controller)["usage"]["job"], {"CPU": 1})
         ray.get(
             controller.set_job_quota.remote(
                 "job", {"CPU": 2}, admin_token=self.admin_token
             )
         )
-        self.assertTrue(ray.get(pending))
+        self.assertTrue(reserve(controller, request, "second"))
         ray.get(
             controller.set_job_quota.remote(
                 "job", {"CPU": 0}, admin_token=self.admin_token
             )
         )
-        third = controller.acquire.remote(request, "third")
+        enqueue(controller, request, "third")
         wait_until(lambda: len(status(controller)["waiting"]) == 1)
         ray.get(
             controller.set_job_quota.remote("job", None, admin_token=self.admin_token)
         )
-        self.assertTrue(ray.get(third))
+        self.assertTrue(reserve(controller, request, "third"))
         for ticket in ("first", "second", "third"):
             ray.get(controller.release.remote(ticket))
 
@@ -765,18 +853,14 @@ class SubmissionQueueTest(unittest.TestCase):
                 num_cpus=0.5, name=name, get_if_exists=True
             ).remote()
             self.assertEqual(first._ray_actor_id, existing._ray_actor_id)
-            self.assertEqual(
-                status(controller)["usage"][job_id], {"CPU": 0.5}
-            )
+            self.assertEqual(status(controller)["usage"][job_id], {"CPU": 0.5})
             pending = pool.submit(Service.options(num_cpus=0.5).remote)
             wait_until(lambda: len(status(controller)["waiting"]) == 1)
             ray.kill(first)
             second = pending.result(timeout=30)
             self.assertTrue(ray.get(second.ready.remote()))
             ray.kill(second)
-            wait_until(
-                lambda: status(controller)["usage"][job_id]["CPU"] == 0
-            )
+            wait_until(lambda: status(controller)["usage"][job_id]["CPU"] == 0)
         finally:
             ray.kill(first)
             if second is not None:
@@ -840,9 +924,7 @@ ray.shutdown()
             self.assertNotEqual(job_id, other["job_id"])
             self.assertEqual(other["job_id"], other["worker_job_id"])
             self.assertEqual(other["denied"], 5)
-            self.assertEqual(
-                status(controller)["quotas"], {job_id: {"CPU": 0}}
-            )
+            self.assertEqual(status(controller)["quotas"], {job_id: {"CPU": 0}})
             self.assertFalse(pending.done())
         finally:
             ray.get(

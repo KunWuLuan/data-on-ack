@@ -9,6 +9,12 @@ selects the **quota namespace**; it does not change the controller location.
 See [中文使用说明](README_ZH.md) for the complete workflow.
 See [controller lifecycle and storage design](DESIGN.md) for failure handling,
 retry guarantees, and the GCS KV record storage implementation.
+The detailed design is also available in [Chinese](DESIGN_ZH.md).
+The [reliability revision](RELIABILITY_PLAN.md) records implemented review fixes
+and remaining acceptance work. The service is not accepted as automatically
+recovering until the full matrix passes.
+See the [end-to-end test guide](tests/e2e/README.md) for real CLI, quota,
+submission and controller-recovery scenarios.
 
 ## Install
 
@@ -40,8 +46,8 @@ reservations are saved as individual Ray GCS KV records. The detached controller
 unexpected actor failure and restores task ObjectRefs and actor IDs to monitor
 their completion. In-flight admission calls are retried by Ray; waiting requests
 re-enter the per-Job queue. Counters and the exact pre-crash waiting order are
-not restored. A reservation granted just before a crash but never tracked by
-its submitter remains reserved until that submitter releases it. Cluster-wide
+not restored. A submission that crossed the durable SUBMITTING boundary but was
+never tracked remains charged until evidence-based reconciliation. Cluster-wide
 durability follows the Ray GCS persistence configuration. No external database
 is required. Saved ObjectRefs cannot be transferred between clusters. Released records are
 compacted below the client's durable acknowledgment watermark. Each process's
